@@ -1,5 +1,9 @@
 # Unreleased
 
+# 0.9.3 (2022-06-21)
+
+- **Breaking:** Rename `Activity::intent_filters` back to `Activity::intent_filter`. ([#305](https://github.com/rust-windowing/android-ndk-rs/pull/305))
+
 # 0.9.2 (2022-06-11)
 
 - Move NDK r23 `-lgcc` workaround to `ndk_build::cargo::cargo_ndk()`, to also apply to our `cargo apk --` invocations. ([#286](https://github.com/rust-windowing/android-ndk-rs/pull/286))
