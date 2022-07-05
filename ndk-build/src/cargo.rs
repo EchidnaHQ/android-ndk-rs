@@ -1,6 +1,7 @@
 use crate::error::NdkError;
 use crate::ndk::Ndk;
 use crate::target::Target;
+use std::env;
 use std::path::Path;
 use std::process::Command;
 
@@ -38,8 +39,10 @@ pub fn cargo_ndk(
     if !rustflags.is_empty() {
         rustflags.push('\x1f');
     }
-    rustflags.push_str("-Clink-arg=");
+    rustflags.push_str("-Clink-args=");
     rustflags.push_str(&clang_target);
+    rustflags.push(' ');
+    rustflags.push_str(&env::var("LINKER_FLAGS").unwrap_or("".to_string()));
 
     let ar = ndk.toolchain_bin("ar", target)?;
     cargo.env(format!("AR_{}", triple), &ar);

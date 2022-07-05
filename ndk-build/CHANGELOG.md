@@ -1,5 +1,7 @@
 # Unreleased
 
+- Allow specifying additional flags to pass to Clang during the linking step with the LINKER_FLAGS environment variable.
+
 # 0.7.0 (2022-07-05)
 
 - Fix NDK r23 `-lgcc` workaround for target directories containing spaces. ([#298](https://github.com/rust-windowing/android-ndk-rs/pull/298))
