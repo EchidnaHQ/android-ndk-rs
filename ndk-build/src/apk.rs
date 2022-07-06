@@ -102,8 +102,12 @@ impl<'a> UnalignedApk<'a> {
         }
 
         aapt.arg(self.0.unaligned_apk()).arg(lib_path_unix);
-
-        if !aapt.status()?.success() {
+        let output = aapt.output()?;
+        if !output.status.success()
+            && !String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("already exists in archive")
+        {
             return Err(NdkError::CmdFailed(aapt));
         }
         Ok(())
