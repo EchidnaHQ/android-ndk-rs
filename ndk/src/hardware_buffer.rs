@@ -4,11 +4,13 @@
 
 #![cfg(feature = "hardware_buffer")]
 
+use crate::utils::status_to_io_result;
+
 pub use super::hardware_buffer_format::HardwareBufferFormat;
 use jni_sys::{jobject, JNIEnv};
 use std::{
-    convert::TryInto, mem::MaybeUninit, ops::Deref, os::raw::c_void, os::unix::io::RawFd,
-    ptr::NonNull,
+    convert::TryInto, io::Result, mem::MaybeUninit, ops::Deref, os::raw::c_void,
+    os::unix::io::RawFd, ptr::NonNull,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -84,21 +86,12 @@ impl HardwareBufferUsage {
         Self(ffi::AHardwareBuffer_UsageFlags_AHARDWAREBUFFER_USAGE_VENDOR_19);
 }
 
-#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
-pub struct HardwareBufferError(pub i32);
-
-pub type Result<T, E = HardwareBufferError> = std::result::Result<T, E>;
-
 pub type Rect = ffi::ARect;
 
-fn construct<T>(with_ptr: impl FnOnce(*mut T) -> i32) -> Result<T, HardwareBufferError> {
+fn construct<T>(with_ptr: impl FnOnce(*mut T) -> i32) -> Result<T> {
     let mut result = MaybeUninit::uninit();
     let status = with_ptr(result.as_mut_ptr());
-    if status == 0 {
-        Ok(unsafe { result.assume_init() })
-    } else {
-        Err(HardwareBufferError(status))
-    }
+    status_to_io_result(status, unsafe { result.assume_init() })
 }
 
 /// A native [`AHardwareBuffer *`]
@@ -110,11 +103,15 @@ pub struct HardwareBuffer {
 }
 
 impl HardwareBuffer {
-    /// Create a `HardwareBuffer` from a native pointer
+    /// Create an _unowned_ [`HardwareBuffer`] from a native pointer
+    ///
+    /// To wrap a strong reference (that is `release`d on [`Drop`]), call
+    /// [`HardwareBufferRef::from_ptr()`] instead.
     ///
     /// # Safety
-    /// By calling this function, you assert that it is a valid pointer to
-    /// an NDK [`ffi::AHardwareBuffer`].
+    /// By calling this function, you assert that it is a valid pointer to an NDK
+    /// [`ffi::AHardwareBuffer`] that is kept alive externally, or retrieve a strong reference
+    /// using [`HardwareBuffer::acquire()`].
     pub unsafe fn from_ptr(ptr: NonNull<ffi::AHardwareBuffer>) -> Self {
         Self { inner: ptr }
     }
@@ -132,16 +129,21 @@ impl HardwareBuffer {
         unsafe {
             let ptr = construct(|res| ffi::AHardwareBuffer_allocate(&desc.into_native(), res))?;
 
-            Ok(HardwareBufferRef {
-                inner: Self::from_ptr(NonNull::new_unchecked(ptr)),
-            })
+            Ok(HardwareBufferRef::from_ptr(NonNull::new_unchecked(ptr)))
         }
     }
 
     /// Create a [`HardwareBuffer`] from JNI pointers
     ///
     /// # Safety
-    /// By calling this function, you assert that it these are valid pointers to JNI objects.
+    /// By calling this function, you assert that these are valid pointers to JNI objects.
+    ///
+    /// This method does not acquire any additional reference to the AHardwareBuffer that is
+    /// returned. To keep the [`HardwareBuffer`] alive after the [Java `HardwareBuffer`] object
+    /// is closed, explicitly or by the garbage collector, be sure to retrieve a strong reference
+    /// using [`HardwareBuffer::acquire()`].
+    ///
+    /// [Java `HardwareBuffer`]: https://developer.android.com/reference/android/hardware/HardwareBuffer
     pub unsafe fn from_jni(env: *mut JNIEnv, hardware_buffer: jobject) -> Self {
         let ptr = ffi::AHardwareBuffer_fromHardwareBuffer(env, hardware_buffer);
 
@@ -219,17 +221,13 @@ impl HardwareBuffer {
                 bytes_per_stride.as_mut_ptr(),
             )
         };
-        if status == 0 {
-            Ok(unsafe {
-                LockedPlaneInfo {
-                    virtual_address: virtual_address.assume_init(),
-                    bytes_per_pixel: bytes_per_pixel.assume_init() as u32,
-                    bytes_per_stride: bytes_per_stride.assume_init() as u32,
-                }
-            })
-        } else {
-            Err(HardwareBufferError(status))
-        }
+        status_to_io_result(status, ()).map(|()| unsafe {
+            LockedPlaneInfo {
+                virtual_address: virtual_address.assume_init(),
+                bytes_per_pixel: bytes_per_pixel.assume_init() as u32,
+                bytes_per_stride: bytes_per_stride.assume_init() as u32,
+            }
+        })
     }
 
     #[cfg(feature = "api-level-29")]
@@ -256,11 +254,7 @@ impl HardwareBuffer {
 
     pub fn unlock(&self) -> Result<()> {
         let status = unsafe { ffi::AHardwareBuffer_unlock(self.as_ptr(), std::ptr::null_mut()) };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(HardwareBufferError(status))
-        }
+        status_to_io_result(status, ())
     }
 
     /// Returns a fence file descriptor that will become signalled when unlocking is completed,
@@ -283,31 +277,44 @@ impl HardwareBuffer {
     }
 
     pub fn send_handle_to_unix_socket(&self, socket_fd: RawFd) -> Result<()> {
-        unsafe {
-            let status = ffi::AHardwareBuffer_sendHandleToUnixSocket(self.as_ptr(), socket_fd);
-            if status == 0 {
-                Ok(())
-            } else {
-                Err(HardwareBufferError(status))
-            }
-        }
+        let status =
+            unsafe { ffi::AHardwareBuffer_sendHandleToUnixSocket(self.as_ptr(), socket_fd) };
+        status_to_io_result(status, ())
     }
 
+    /// Acquire a reference on the given [`HardwareBuffer`] object.
+    ///
+    /// This prevents the object from being deleted until the last strong reference, represented
+    /// by [`HardwareBufferRef`], is [`drop()`]ped.
     pub fn acquire(&self) -> HardwareBufferRef {
         unsafe {
             ffi::AHardwareBuffer_acquire(self.as_ptr());
-        }
-        HardwareBufferRef {
-            inner: HardwareBuffer { inner: self.inner },
+            HardwareBufferRef::from_ptr(self.inner)
         }
     }
 }
 
-/// A [`HardwareBuffer`] with an owned reference, the reference is released when dropped.
+/// A [`HardwareBuffer`] with an owned reference, that is released when dropped.
 /// It behaves much like a strong [`std::rc::Rc`] reference.
 #[derive(Debug)]
 pub struct HardwareBufferRef {
     inner: HardwareBuffer,
+}
+
+impl HardwareBufferRef {
+    /// Create an _owned_ [`HardwareBuffer`] from a native pointer
+    ///
+    /// To wrap a weak reference (that is **not** `release`d on [`Drop`]), call
+    /// [`HardwareBuffer::from_ptr()`] instead.
+    ///
+    /// # Safety
+    /// By calling this function, you assert that it is a valid pointer to an NDK
+    /// [`ffi::AHardwareBuffer`].
+    pub unsafe fn from_ptr(ptr: NonNull<ffi::AHardwareBuffer>) -> Self {
+        Self {
+            inner: HardwareBuffer { inner: ptr },
+        }
+    }
 }
 
 impl Deref for HardwareBufferRef {
@@ -320,9 +327,13 @@ impl Deref for HardwareBufferRef {
 
 impl Drop for HardwareBufferRef {
     fn drop(&mut self) {
-        unsafe {
-            ffi::AHardwareBuffer_release(self.inner.as_ptr());
-        }
+        unsafe { ffi::AHardwareBuffer_release(self.inner.as_ptr()) }
+    }
+}
+
+impl Clone for HardwareBufferRef {
+    fn clone(&self) -> Self {
+        self.acquire()
     }
 }
 
