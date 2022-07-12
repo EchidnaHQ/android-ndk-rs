@@ -7,13 +7,16 @@ use ndk::native_activity::NativeActivity;
 use ndk::native_window::NativeWindow;
 use ndk_sys::{AInputQueue, ANativeActivity, ANativeWindow, ARect};
 use once_cell::sync::Lazy;
+use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::ops::Deref;
 use std::os::raw;
 use std::os::unix::prelude::*;
 use std::ptr::NonNull;
-use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 #[cfg(feature = "logger")]
@@ -65,22 +68,77 @@ pub fn native_activity() -> &'static NativeActivity {
     unsafe { NATIVE_ACTIVITY.as_ref().unwrap() }
 }
 
-/// This function accesses a `static` variable internally and must only be used if you are sure
-/// there is exactly one version of `ndk_glue` in your dependency tree.
-pub fn native_window() -> RwLockReadGuard<'static, Option<NativeWindow>> {
-    NATIVE_WINDOW.read().unwrap()
+pub struct LockReadGuard<T: ?Sized + 'static>(MappedRwLockReadGuard<'static, T>);
+
+impl<T> LockReadGuard<T> {
+    /// Transpose an [`Option`] wrapped inside a [`LockReadGuard`]
+    ///
+    /// This is a _read_ lock for which the contents can't change; hence allowing the user to only
+    /// check for [`None`] once and hold a lock containing `T` directly thereafter, without
+    /// subsequent infallible [`Option::unwrap()`]s.
+    fn from_wrapped_option(wrapped: RwLockReadGuard<'static, Option<T>>) -> Option<Self> {
+        RwLockReadGuard::try_map(wrapped, Option::as_ref)
+            .ok()
+            .map(Self)
+    }
 }
 
+impl<T: ?Sized> Deref for LockReadGuard<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for LockReadGuard<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<T: ?Sized + fmt::Display> fmt::Display for LockReadGuard<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Returns a [`NativeWindow`] held inside a lock, preventing Android from freeing it immediately
+/// in [its `NativeWindow` destructor].
+///
+/// If the window is in use by e.g. a graphics API, make sure to hold on to this lock.
+///
+/// After receiving [`Event::WindowDestroyed`] `ndk-glue` will block in Android's [`NativeWindow`] destructor
+/// callback until the lock is released, returning to Android and allowing it to free the window.
+///
+/// [its `NativeWindow` destructor]: https://developer.android.com/ndk/reference/struct/a-native-activity-callbacks#onnativewindowdestroyed
+///
+/// # Warning
 /// This function accesses a `static` variable internally and must only be used if you are sure
 /// there is exactly one version of `ndk_glue` in your dependency tree.
-pub fn input_queue() -> RwLockReadGuard<'static, Option<InputQueue>> {
-    INPUT_QUEUE.read().unwrap()
+pub fn native_window() -> Option<LockReadGuard<NativeWindow>> {
+    LockReadGuard::from_wrapped_option(NATIVE_WINDOW.read())
+}
+
+/// Returns an [`InputQueue`] held inside a lock, preventing Android from freeing it immediately
+/// in [its `InputQueue` destructor].
+///
+/// After receiving [`Event::InputQueueDestroyed`] `ndk-glue` will block in Android's [`InputQueue`] destructor
+/// callback until the lock is released, returning to Android and allowing it to free the window.
+///
+/// [its `InputQueue` destructor]: https://developer.android.com/ndk/reference/struct/a-native-activity-callbacks#oninputqueuedestroyed
+///
+/// # Warning
+/// This function accesses a `static` variable internally and must only be used if you are sure
+/// there is exactly one version of `ndk_glue` in your dependency tree.
+pub fn input_queue() -> Option<LockReadGuard<InputQueue>> {
+    LockReadGuard::from_wrapped_option(INPUT_QUEUE.read())
 }
 
 /// This function accesses a `static` variable internally and must only be used if you are sure
 /// there is exactly one version of `ndk_glue` in your dependency tree.
 pub fn content_rect() -> Rect {
-    CONTENT_RECT.read().unwrap().clone()
+    CONTENT_RECT.read().clone()
 }
 
 static PIPE: Lazy<[RawFd; 2]> = Lazy::new(|| {
@@ -129,19 +187,34 @@ pub enum Event {
     LowMemory,
     WindowLostFocus,
     WindowHasFocus,
+    /// A [`NativeWindow`] is now available through [`native_window()`]. See that function for more
+    /// details about holding on to the returned [`LockReadGuard`].
+    ///
+    /// Be sure to release any resources (e.g. Vulkan/OpenGL graphics surfaces) created from
+    /// it followed by releasing this lock upon receiving [`Event::WindowDestroyed`].
     WindowCreated,
     WindowResized,
     WindowRedrawNeeded,
-    /// If the window is in use by ie. a graphics API, make sure the lock from
+    /// If the window is in use by e.g. a graphics API, make sure the [`LockReadGuard`] from
     /// [`native_window()`] is held on to until after freeing those resources.
     ///
-    /// After receiving this [`Event`] `ndk_glue` will block until that read-lock
-    /// is released before returning to Android and allowing it to free up the window.
+    /// After receiving this [`Event`] `ndk_glue` will block inside its [`NativeWindow`] destructor
+    /// until that read-lock is released before returning to Android and allowing it to free the
+    /// window.
+    ///
+    /// From this point [`native_window()`] will return [`None`] until receiving
+    /// [`Event::WindowCreated`] again.
     WindowDestroyed,
+    /// An [`InputQueue`] is now available through [`input_queue()`].
+    ///
+    /// Be sure to release the returned lock upon receiving [`Event::InputQueueDestroyed`].
     InputQueueCreated,
-    /// After receiving this [`Event`] `ndk_glue` will block until the read-lock from
-    /// [`input_queue()`] is released before returning to Android and allowing it to
-    /// free up the input queue.
+    /// After receiving this [`Event`] `ndk_glue` will block inside its [`InputQueue`] destructor
+    /// until the read-lock from [`input_queue()`] is released before returning to Android and
+    /// allowing it to free the input queue.
+    ///
+    /// From this point [`input_queue()`] will return [`None`] until receiving
+    /// [`Event::InputQueueCreated`] again.
     InputQueueDestroyed,
     ContentRectChanged,
 }
@@ -286,7 +359,6 @@ unsafe extern "C" fn on_window_focus_changed(
 unsafe extern "C" fn on_window_created(activity: *mut ANativeActivity, window: *mut ANativeWindow) {
     NATIVE_WINDOW
         .write()
-        .unwrap()
         .replace(NativeWindow::clone_from_ptr(NonNull::new(window).unwrap()));
     wake(activity, Event::WindowCreated);
 }
@@ -310,7 +382,7 @@ unsafe extern "C" fn on_window_destroyed(
     window: *mut ANativeWindow,
 ) {
     wake(activity, Event::WindowDestroyed);
-    let mut native_window_guard = NATIVE_WINDOW.write().unwrap();
+    let mut native_window_guard = NATIVE_WINDOW.write();
     assert_eq!(native_window_guard.as_ref().unwrap().ptr().as_ptr(), window);
     native_window_guard.take();
 }
@@ -325,7 +397,7 @@ unsafe extern "C" fn on_input_queue_created(
     // future code cleans it up and sets it back to `None` again.
     let looper = locked_looper.as_ref().expect("Looper does not exist");
     input_queue.attach_looper(looper, NDK_GLUE_LOOPER_INPUT_QUEUE_IDENT);
-    INPUT_QUEUE.write().unwrap().replace(input_queue);
+    INPUT_QUEUE.write().replace(input_queue);
     wake(activity, Event::InputQueueCreated);
 }
 
@@ -334,7 +406,7 @@ unsafe extern "C" fn on_input_queue_destroyed(
     queue: *mut AInputQueue,
 ) {
     wake(activity, Event::InputQueueDestroyed);
-    let mut input_queue_guard = INPUT_QUEUE.write().unwrap();
+    let mut input_queue_guard = INPUT_QUEUE.write();
     assert_eq!(input_queue_guard.as_ref().unwrap().ptr().as_ptr(), queue);
     let input_queue = InputQueue::from_ptr(NonNull::new(queue).unwrap());
     input_queue.detach_looper();
@@ -348,6 +420,6 @@ unsafe extern "C" fn on_content_rect_changed(activity: *mut ANativeActivity, rec
         right: (*rect).right as _,
         bottom: (*rect).bottom as _,
     };
-    *CONTENT_RECT.write().unwrap() = rect;
+    *CONTENT_RECT.write() = rect;
     wake(activity, Event::ContentRectChanged);
 }
