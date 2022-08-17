@@ -218,6 +218,12 @@ impl Apk {
         } else {
             let mut adb = self.ndk.platform_tool(bin!("adb"))?;
             adb.arg("install").arg("-r").arg(&self.path);
+            if std::env::var("CARGO_APK_STREAMING")
+                .map(|var| var == "1")
+                .unwrap_or(false)
+            {
+                adb.arg("--streaming");
+            }
             if !adb.status()?.success() {
                 return Err(NdkError::CmdFailed(adb));
             }
